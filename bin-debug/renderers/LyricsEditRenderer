@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<s:ItemRenderer xmlns:fx="http://ns.adobe.com/mxml/2009" 
+				xmlns:s="library://ns.adobe.com/flex/spark" 
+				xmlns:mx="library://ns.adobe.com/flex/mx" 
+				autoDrawBackground="true">
+	<fx:Script>
+		<![CDATA[
+			import mx.events.FlexEvent;
+			
+			private static function getApp( renderer : LyricsInputRenderer ) : LyricsDictation
+			{
+				if( renderer.parentDocument.parentDocument is LyricsDictation )
+					return renderer.parentDocument.parentDocument as LyricsDictation;
+				return renderer.parentDocument.parentDocument.parent as LyricsDictation;
+			}
+			
+			private function onEnterKeyDown( e : FlexEvent ) : void
+			{
+				getApp( this ).checkAnswer( lyricsInput, data.lyrics );
+			}
+			
+			private function onKeyDown( e : KeyboardEvent ) : void
+			{
+				if( e.keyCode == Keyboard.TAB )
+				{
+					e.preventDefault();
+					if( e.shiftKey ) getApp( this ).prevLyrics();
+					else getApp( this ).nextLyrics();
+					
+					getApp( this ).stopSong();
+					getApp( this ).playSong( getApp( this ).getCurrentLyricsTime() );
+				}
+			}
+		]]>
+	</fx:Script>
+	
+	<s:RichEditableText id="lyricsInput" width="100%" fontSize="13" textAlign="center" multiline="false"
+						paddingLeft="5" paddingTop="5" paddingRight="5" paddingBottom="5"
+						enter="onEnterKeyDown( event )" keyDown="onKeyDown( event )" />
+	
+</s:ItemRenderer>

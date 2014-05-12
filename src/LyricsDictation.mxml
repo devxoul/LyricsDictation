@@ -1,0 +1,893 @@
+<?xml version="1.0" encoding="utf-8"?>
+<s:WindowedApplication xmlns:fx="http://ns.adobe.com/mxml/2009" 
+					   xmlns:s="library://ns.adobe.com/flex/spark" 
+					   xmlns:mx="library://ns.adobe.com/flex/mx"
+					   xmlns:components="components.*"
+					   creationComplete="init()" showStatusBar="false" fontFamily="Helvetica, MalgunGothic, Dotum">
+	<fx:Style>
+		@namespace s "library://ns.adobe.com/flex/spark";
+		@namespace mx "library://ns.adobe.com/flex/mx";
+		@namespace components "components.*";
+		
+		mx|Alert {
+			cornerRadius: 5px;
+			buttonStyleName: alertButton;
+		}
+		
+		.alertButton {
+			cornerRadius: 11px;
+		}
+	</fx:Style>
+	
+	<fx:Script>
+		<![CDATA[
+			import managers.ExceptionManager;
+			
+			import mx.collections.ArrayList;
+			import mx.controls.Alert;
+			import mx.events.CloseEvent;
+			import mx.events.FlexEvent;
+			import mx.managers.IFocusManagerComponent;
+			import mx.utils.ObjectUtil;
+			import mx.utils.StringUtil;
+			
+			import parsers.LRCParser;
+			
+			import renderers.LyricsInputRenderer;
+			import renderers.LyricsRenderer;
+			
+			import spark.components.RichEditableText;
+			import spark.events.IndexChangeEvent;
+			import spark.skins.spark.ListSkin;
+			import spark.skins.spark.ScrollerSkin;
+			
+			import utils.getFormattedTimeString;
+			import utils.getListItemRenderer;
+			
+			
+			private var _songFile : File;
+			private var _songFileFilter : FileFilter;
+			private var _lyricsFile : File;
+			private var _lyricsFileFilter : FileFilter;
+			private var _lyricsFileStream : FileStream;
+			
+			private var _song : Sound;
+			private var _channel : SoundChannel;
+			private var _soundTransform : SoundTransform;
+			private var _playing : Boolean;
+			
+			[Bindable]
+			private var lrcs : ArrayList;
+			
+			private var _timer : Timer;
+			private var _time : int;
+			private var _currentLRCIndex : int = -1;
+			
+			private var _timeSliderDragging : Boolean;
+			
+			[Bindable]
+			public var edittingLRCs : ArrayList;
+			public static var hasBeenEditted : Boolean;
+			
+			private function init() : void
+			{	
+				_songFile = new File;
+				_songFile.addEventListener( Event.SELECT, onSongFileSelect );
+				_songFileFilter = new FileFilter( "MP3 Files (*.mp3)", "*.mp3" );
+				
+				_lyricsFile = new File;
+				_lyricsFile.addEventListener( Event.SELECT, onLyricsFileSelect );
+				_lyricsFileFilter = new FileFilter( "Lyrics Files (*.lrc)", "*.lrc" );
+				_lyricsFileStream = new FileStream;
+				
+				_timer = new Timer( 0 );
+				_timer.addEventListener( TimerEvent.TIMER, onTimer );
+			}
+			
+			/**
+			 * 노래 열기 버튼 클릭
+			 */
+			private function onLoadSongButtonClick( e : MouseEvent ) : void
+			{
+				_songFile.browseForOpen( "노래 선택", [_songFileFilter] );
+			}
+			
+			/**
+			 * 가사 열기 버튼 클릭
+			 */
+			private function onLoadLyricsButtonClick( e : MouseEvent ) : void
+			{
+				if( hasBeenEditted )
+				{
+					Alert.show( "변경 사항이 있습니다. 가사 저장 버튼을 눌러 가사를 저장하거나, 변경 취소 버튼을 눌러 취소하시기 바랍니다." );
+					return;
+				}
+				_lyricsFile.browseForOpen( "가사 선택", [_lyricsFileFilter] );
+			}
+			
+			/**
+			 * 노래 선택 완료
+			 */
+			private function onSongFileSelect( e : Event ) : void
+			{
+				trace( _songFile.nativePath );
+				if( _song )
+				{
+					stopSong();
+					_song.removeEventListener( Event.COMPLETE, onSongLoadComplete );
+					_song = null;
+				}
+				_song = new Sound;
+				_song.addEventListener( Event.COMPLETE, onSongLoadComplete );
+				_song.load( new URLRequest( "file:///" + _songFile.nativePath ) );
+			}
+			
+			/**
+			 * 가사 선택 완료
+			 */
+			private function onLyricsFileSelect( e : Event ) : void
+			{
+				if( lrcs )
+				{
+					lrcs.source.length = 0;
+				}
+				_lyricsFileStream.open( _lyricsFile, FileMode.READ );
+				var lrc : String = _lyricsFileStream.readUTFBytes( _lyricsFileStream.bytesAvailable );
+				lrcs = new ArrayList( LRCParser.parse( lrc ) );
+				if( currentState == "edit" )
+					copyLRCsToEdittingLRCs();
+			}
+			
+			/**
+			 * 노래 로드 완료
+			 */
+			private function onSongLoadComplete( e : Event ) : void
+			{
+				trace( "complete" );
+				standbyPlayer();
+			}
+			
+			/**
+			 * 플레이어 세팅
+			 */
+			private function standbyPlayer() : void
+			{
+				songTitleLabel.text = _song.id3.songName;
+				singerLabel.text = _song.id3.artist;
+				timeSlider.maximum = int( _song.length );
+				timeSlider.value = _time = 0;
+			}
+			
+			/**
+			 * 타이머 핸들러
+			 */
+			private function onTimer( e : TimerEvent ) : void
+			{
+				_time = int( _channel.position );
+				timeLabel.text = getFormattedTimeString( _time );
+				if( !_timeSliderDragging ) timeSlider.value = _time;
+				
+				if( currentState == "edit" ) return;
+				if( !lrcs.source[_currentLRCIndex + 1] ) return;
+				
+				// 다음 구간으로
+				if( lrcs.source[_currentLRCIndex + 1].time <= _time )
+				{
+					trace( "다음 구간~" );
+					
+					if( currentState == "study" )
+					{
+						nextLyrics();
+					}
+					else if( currentState == "dictation" )
+					{
+						if( _currentLRCIndex > -1 )
+						{
+							stopSong();
+						}
+						else
+						{
+							nextLyrics();
+							setFocusToCurrentLyricsInput();
+						}
+					}
+				}
+			}
+			
+			/**
+			 * 노래 재생이 끝나면 실행되는 메서드.
+			 */
+			private function onSongEnd( e : Event ) : void
+			{
+				trace( "노래 끗" );
+				stopSong();
+				
+				if( currentState == "dictation" )
+				{
+					stopDictation();
+				}
+			}
+			
+			/**
+			 * 볼륨 슬라이더 값 변경
+			 */
+			private function onVolumeSliderChange( e : Event ) : void
+			{
+				if( hasException( ExceptionType.NO_SONG ) || hasException( ExceptionType.NO_LRC ) ) return;
+				if( !_soundTransform ) return;
+				
+				_soundTransform.volume = volumeSlider.value / 100;
+				_channel.soundTransform = _soundTransform;
+			}
+			
+			/**
+			 * 재생 슬라이더 값 변경 시작 (마우스 다운)
+			 */
+			private function onTimeSliderChageStart( e : FlexEvent ) : void
+			{
+				_timeSliderDragging = true;
+			}
+			
+			/**
+			 * 재생 슬라이더 값 변경 끝 (마우스 업)
+			 */
+			private function onTimeSliderChageEnd( e : FlexEvent ) : void
+			{
+				if( !lrcs ) return;
+				
+				_time = timeSlider.value;
+				if( _playing )
+				{
+					stopSong();
+					playSong( _time );
+				}
+				var len : int = lrcs.length - 1;
+				for( var i : int = 0; i < len; i++ )
+				{
+					if( lrcs.source[i].time <= _time && _time < lrcs.source[i + 1].time )
+					{
+						_currentLRCIndex = i;
+						scrollToCurrentLyrics();
+						break;
+					}
+				}
+				highlightCurrentLyrics();
+				_timeSliderDragging = false;
+			}
+			
+			/**
+			 * 이전구간 버튼 클릭
+			 */
+			private function onPrevButtonClick( e : MouseEvent ) : void
+			{
+				if( !lrcs ) return;
+				
+				stopSong();
+				prevLyrics();
+				playSong( getCurrentLyricsTime() );
+			}
+			
+			/**
+			 * 재생/일시정지 버튼 클릭
+			 */
+			private function onPlayPauseButtonClick( e : MouseEvent ) : void
+			{
+				if( _playing ) stopSong();
+				else
+					if( currentState == "study" ) playSong( _time );
+					else playSong( getCurrentLyricsTime() );
+			}
+			
+			/**
+			 * 다음구간 버튼 클릭
+			 */
+			private function onNextButtonClick( e : MouseEvent ) : void
+			{
+				if( !lrcs ) return;
+				stopSong();
+				nextLyrics();
+				playSong( getCurrentLyricsTime() );
+			}
+			
+			/**
+			 * 노래 재생
+			 */
+			public function playSong( time : int = 0 ) : void
+			{
+				if( hasException( ExceptionType.NO_SONG ) )
+				{
+					ExceptionManager.showAlert( ExceptionType.NO_SONG );
+					return;
+				}
+				
+				if( hasException( ExceptionType.NO_LRC ) )
+				{
+					ExceptionManager.showAlert( ExceptionType.NO_LRC );
+					return;
+				}
+				
+				_time = time;
+				
+				if( _channel )
+				{
+					_channel.removeEventListener( Event.SOUND_COMPLETE, onSongEnd );
+					_channel = null;
+				}
+				_channel = _song.play( _time );
+				_channel.addEventListener( Event.SOUND_COMPLETE, onSongEnd );
+				_soundTransform = _channel.soundTransform;
+				_soundTransform.volume = volumeSlider.value / 100;
+				_channel.soundTransform = _soundTransform;
+				_playing = true;
+				_timer.start();
+				playPauseButton.currentState = "play";
+			}
+			
+			/**
+			 * 노래 정지
+			 */
+			public function stopSong() : void
+			{
+				if( !_channel ) return;
+				_channel.stop();
+				_timer.stop();
+				_playing = false;
+				playPauseButton.currentState = "pause";
+			}
+			
+			/**
+			 * 가사 리스트 클릭
+			 */
+			private function onLyricsListClick( e : MouseEvent ) : void
+			{
+				highlightCurrentLyrics();
+			}
+			
+			/**
+			 * 가사 리스트 더블클릭
+			 */
+			private function onLyricsListDoubleClick( e : MouseEvent ) : void
+			{
+				if( e.target is LyricsRenderer )
+				{
+					stopSong();
+					playSong( lrcs.source[_currentLRCIndex = lyricsList.selectedIndex].time );
+				}
+			}
+			
+			/**
+			 * 현재 가사 하이라이트
+			 */
+			private function highlightCurrentLyrics() : void
+			{
+				switch( currentState )
+				{
+					case "study" :
+						lyricsList.selectedIndex = _currentLRCIndex;
+						break;
+					
+					case "dictionary" :
+						lyricsInputList.selectedIndex = _currentLRCIndex;
+						break;
+					
+					case "dictionary" :
+						lyricsEditGrid.selectedIndex = _currentLRCIndex;
+						break;
+				}
+			}
+			
+			/**
+			 * 정답 검사
+			 * @param lyricsInput lyricsInputList의 lyricsInputRenderer 안에 있는 RichEditableText
+			 * @param answer 정답
+			 */
+			public function checkAnswer( lyricsInput : RichEditableText, answer : String ) : void
+			{
+				if( hasException( ExceptionType.CURRENT_LRC_INDEX_OUT_OF_RANGE ) ) return;
+				
+				lyricsInput.appendText( String.fromCharCode( 16 ) );
+				lyricsInput.text = lyricsInput.text.split( String.fromCharCode( 16 ) ).join( "" );
+				lyricsInput.textFlow.textAlign = "center";
+				lyricsInput.selectRange( lyricsInput.text.length, lyricsInput.text.length );
+				
+				var input : String = getCheckableString( lyricsInput.text );
+				var originalAnswer : String = answer;
+				answer = getCheckableString( lrcs.source[_currentLRCIndex].lyrics );
+				
+				trace( "입력 :", input );
+				trace( "정답 :", answer );
+				if( input == answer )
+				{
+					trace( "정ㅋ답ㅋ" );
+					if( _playing ) stopSong();
+					nextLyrics();
+					setFocusToCurrentLyricsInput();
+					playSong( _time );
+				}
+				else
+				{
+					trace( "틀ㅠ림ㅠ" );
+					stopSong();
+					playSong( getCurrentLyricsTime() );
+					lyricsInput.text = lyricsInput.text.substring( 0, getLastCorrectIndex( input, answer ) );
+					lyricsInput.textFlow.textAlign = "center";
+					lyricsInput.selectRange( lyricsInput.text.length, lyricsInput.text.length );
+				}
+			}
+			
+			/**
+			 * 특수문자 제거하여 비교 가능하게 문자들을 변환시킨 후 되돌려준다.
+			 */
+			private function getCheckableString( str : String ) : String
+			{
+				return str.replace( /[`~!@#$%^&*()\[\]{}<>\-_=\/?\\:;,.'"]/gi, "" ).toLowerCase();
+			}
+			
+			/**
+			 * 첫 번째 문자열과 두 번째 문자열을 비교해서 몇 번째 인덱스까지 일치하는지를 되돌려준다.
+			 * @return 마지막 일치하는 문자의 인덱스.
+			 */
+			private function getLastCorrectIndex( str1 : String, str2 : String ) : int
+			{
+				const symbols : String = "`~!@#$%^&*()[]{}<>-_=/?:;,.\'\"";
+				var numSymbolsInStr1 : int = 0;
+				var numSymbolsInStr2 : int = 0;
+				var len : int = Math.min( str1.length, str2.length );
+				for( var  i : int = 0; i < len; i++ )
+				{
+//					trace( symbols.search( str1.charAt( i ) ) );
+					
+					if( symbols.search( str1.charAt( i ) ) > -1 )
+						numSymbolsInStr1 ++;
+					
+					if( symbols.search( str2.charAt( i ) ) > -1 )
+						numSymbolsInStr2 ++;
+					
+					if( str1.charAt( i - numSymbolsInStr1 ) != str2.charAt( i - numSymbolsInStr2 ) )
+						return i;
+				}
+				return len;
+			}
+			
+			/**
+			 * 현재 입력해야할 텍스트 인풋에 포커스를 맞춘다.
+			 */
+			private function setFocusToCurrentLyricsInput() : void
+			{
+				if( hasException( ExceptionType.NO_SONG ) )
+				{
+					ExceptionManager.showAlert( ExceptionType.NO_SONG );
+					return;
+				}
+				
+				if( hasException( ExceptionType.NO_LRC ) )
+				{
+					ExceptionManager.showAlert( ExceptionType.NO_LRC );
+					return;
+				}
+//				
+				var currentLyricsInput : RichEditableText = ( getListItemRenderer( lyricsInputList, _currentLRCIndex ) as LyricsInputRenderer ).lyricsInput;
+				focusManager.setFocus( currentLyricsInput );
+				currentLyricsInput.selectRange( currentLyricsInput.text.length, currentLyricsInput.text.length );
+			}
+			
+			/**
+			 * 이전 가사로 이동한다.
+			 */
+			public function prevLyrics() : void
+			{
+				if( _currentLRCIndex > 0 )
+					_currentLRCIndex --;
+				highlightCurrentLyrics();
+				scrollToCurrentLyrics();
+				if( currentState == "dictation" )
+				{
+					setFocusToCurrentLyricsInput();
+				}
+			}
+			
+			/**
+			 * 다음 가사로 이동한다.
+			 */
+			public function nextLyrics() : void
+			{
+				if( _currentLRCIndex < lrcs.length - 1 )
+					_currentLRCIndex ++;
+				highlightCurrentLyrics();
+				scrollToCurrentLyrics();
+				if( currentState == "dictation" )
+				{
+					setFocusToCurrentLyricsInput();
+				}
+			}
+			
+			/**
+			 * 현재 가사로 스크롤한다.
+			 */
+			private function scrollToCurrentLyrics() : void
+			{
+				if( currentState == "study" ) lyricsList.ensureIndexIsVisible( _currentLRCIndex );
+				else if( currentState == "dictionary" ) lyricsInputList.ensureIndexIsVisible( _currentLRCIndex );
+			}
+			
+			/**
+			 * 현재 진행중인 가사의 시간을 반환한다.
+			 */
+			public function getCurrentLyricsTime() : int
+			{
+				if( hasException( ExceptionType.CURRENT_LRC_INDEX_UNDERFLOW ) ) return 0;
+				return lrcs.source[_currentLRCIndex].time;
+			}
+			
+			/**
+			 * 받아쓰기 리스트에서 다른 아이템이 선택되었을 때
+			 */
+			private function onLyricsInputListChange( e : IndexChangeEvent ) : void
+			{
+				if( e.oldIndex == e.newIndex ) return;
+				
+				_currentLRCIndex = e.newIndex;
+				if( _playing ) stopSong();
+				playSong( getCurrentLyricsTime() );
+			}
+			
+			private function onDictationButtonClick( e : MouseEvent ) : void
+			{
+				if( currentState == "study" )
+				{
+					if( hasException( ExceptionType.NO_SONG ) )
+					{
+						ExceptionManager.showAlert( ExceptionType.NO_SONG );
+						return;
+					}
+					
+					if( hasException( ExceptionType.NO_LRC ) )
+					{
+						ExceptionManager.showAlert( ExceptionType.NO_LRC );
+						return;
+					}
+					
+					Alert.show( "OK 버튼을 누르면 받아쓰기가 시작됩니다.\nCancel 버튼을 누를 경우 이전 상태로 돌아갑니다.", "", Alert.OK | Alert.CANCEL, null, onDictationAlertClose );
+				}
+				else
+				{
+					Alert.show( "받아쓰기를 끝냅니다.", "", Alert.YES | Alert.NO, null, onDictationAlertClose );
+				}
+				
+				stopSong();
+			}
+			
+			private function onDictationAlertClose( e : CloseEvent ) : void
+			{
+				switch( e.detail )
+				{
+					// "받아쓰기가 시작됩니다."
+					case Alert.OK :
+						startDictation();
+						break;
+					
+					// "받아쓰기를 끝냅니다."
+					case Alert.YES :
+						stopDictation();
+						break;
+					
+					// "받아쓰기를 끝냅니다."
+					case Alert.NO :
+						if( currentState == "dictation" )
+						{
+							setFocusToCurrentLyricsInput();
+							playSong( _time );
+						}
+						break;
+				}
+			}
+			
+			/**
+			 * 받아쓰기를 시작한다.
+			 */
+			private function startDictation() : void
+			{
+				currentState = "dictation";
+				var len : int = lrcs.length;
+				for( var i : int = 0; i < len; i++ )
+				{
+					var lyricsInputRenderer : LyricsInputRenderer = getListItemRenderer( lyricsInputList, i ) as LyricsInputRenderer;
+					if( lyricsInputRenderer ) lyricsInputRenderer.lyricsInput.text = "";
+				}
+				_currentLRCIndex = -1;
+				_time = 0;
+				playSong();
+			}
+			
+			/**
+			 * 받아쓰기를 멈춘다.
+			 */
+			private function stopDictation() : void
+			{
+				currentState = "study";
+				_currentLRCIndex = -1;
+				_time = 0;
+			}
+			
+			/**
+			 * 예외가 있는지를 검사한다.
+			 */
+			private function hasException( exceptionType : String ) : Boolean
+			{
+				switch( exceptionType )
+				{
+					case ExceptionType.NO_SONG :
+						if( !_song ) return true;
+						break;
+					
+					case ExceptionType.NO_LRC :
+						if( !lrcs ) return true;
+						break;
+					
+					case ExceptionType.CURRENT_LRC_INDEX_UNDERFLOW :
+						if( _currentLRCIndex < 0 ) return true;
+						break;
+					
+					case ExceptionType.CURRENT_LRC_INDEX_OVERFLOW :
+						if( _currentLRCIndex >= lrcs.length ) return true;
+						break;
+					
+					case ExceptionType.CURRENT_LRC_INDEX_OUT_OF_RANGE :
+						if( hasException( ExceptionType.CURRENT_LRC_INDEX_UNDERFLOW ) || hasException( ExceptionType.CURRENT_LRC_INDEX_OVERFLOW ) ) return true;
+						break;
+				}
+				
+				return false;
+			}
+			
+			/**
+			 * 편집모드 체크박스의 값이 변경될 때
+			 */
+			private function onEditModeCheckBoxChange( e : Event ) : void
+			{
+				if( e.target.selected )
+				{
+					if( hasException( ExceptionType.NO_LRC ) )
+					{
+						ExceptionManager.showAlert( ExceptionType.NO_LRC );
+						e.target.selected = false;
+						return;
+					}
+					
+					copyLRCsToEdittingLRCs();
+					currentState = "edit";
+				}
+				else
+				{
+					if( hasBeenEditted )
+					{
+						Alert.show( "가사 저장 혹은 변경 취소를 해주세요." );
+						e.target.selected = true;
+					}
+					else
+					{
+						currentState = "study";
+					}
+				}
+			}
+			
+			/**
+			 * 가사 저장 버튼 클릭
+			 */
+			private function onSaveLyricsButtonClick( e : MouseEvent ) : void
+			{
+				focusManager.setFocus( playPauseButton as Button );
+				hasBeenEditted = false;
+				copyLRCs( edittingLRCs, lrcs );
+				var lrc : String = LRCParser.make( edittingLRCs.source );
+				_lyricsFileStream.open( _lyricsFile, FileMode.WRITE );
+				_lyricsFileStream.writeUTFBytes( lrc );
+				_lyricsFileStream.close();
+				
+				currentState = "study";
+				editModeCheckBox.selected = false;
+			}
+			
+			/**
+			 * 변경 취소 버튼 클릭
+			 */
+			private function onCancelChangesButtonClick( e : MouseEvent ) : void
+			{
+				Alert.show( "변경을 취소하시겠습니까?", "", Alert.YES | Alert.NO, null, onCancelChangesAlertClose );
+			}
+			
+			/**
+			 * 구간 추가 버튼 클릭
+			 */
+			private function onAddLyricsButtonClick( e : MouseEvent ) : void
+			{
+				edittingLRCs.addItemAt( new LRC, lyricsEditGrid.selectedIndex + 1 );
+			}
+			
+			/**
+			 * 구간 삭제 버튼 클릭
+			 */
+			private function onDeleteLyricsButtonClick( e : MouseEvent ) : void
+			{
+				var selectedIndex :int = lyricsEditGrid.selectedIndex;
+				edittingLRCs.removeItemAt( selectedIndex );
+				lyricsEditGrid.selectedIndex = selectedIndex;
+			}
+			
+			/**
+			 * edittingLRCs에 lrcs의 내용을 복제한다.
+			 */
+			private function copyLRCsToEdittingLRCs() : void
+			{
+				if( !edittingLRCs ) edittingLRCs = new ArrayList;
+				if( edittingLRCs.length ) edittingLRCs.removeAll();
+				for each( var sourceLRC : LRC in lrcs.source )
+				{
+					var lrc : LRC = new LRC;
+					lrc.time = sourceLRC.time;
+					lrc.formattedTimeString = sourceLRC.formattedTimeString;
+					lrc.lyrics = sourceLRC.lyrics;
+					edittingLRCs.addItem( lrc );
+				}
+			}
+			
+			private function copyLRCs( source : ArrayList, destination : ArrayList ) : void
+			{
+				if( !destination ) destination = new ArrayList;
+				if( destination.length ) destination.removeAll();
+				for each( var sourceLRC : LRC in source.source )
+				{
+					var lrc : LRC = new LRC;
+					lrc.time = sourceLRC.time;
+					lrc.formattedTimeString = sourceLRC.formattedTimeString;
+					lrc.lyrics = sourceLRC.lyrics;
+					destination.addItem( lrc );
+				}
+			}
+			
+			private function onCancelChangesAlertClose( e : CloseEvent ) : void
+			{
+				if( e.detail == Alert.YES )
+				{
+					hasBeenEditted = false;
+					editModeCheckBox.selected = false;
+					currentState = "study";
+				}
+			}
+			
+		]]>
+	</fx:Script>
+	
+	<s:states>
+		<s:State name="study" />
+		<s:State name="dictation" />
+		<s:State name="edit" />
+	</s:states>
+	
+	<s:layout>
+		<s:VerticalLayout horizontalAlign="center" gap="0" />
+	</s:layout>
+	
+	<s:Group width="100%">
+		<s:Group width="100%" mouseDown="nativeWindow.startMove()">
+			<s:BitmapImage source="@Embed( source='assets/images/top_bg.png', scaleGridLeft='10', scaleGridTop='10', scaleGridRight='90', scaleGridBottom='100' )" width="100%" />
+		</s:Group>
+		
+		<s:HGroup x="590" y="8">
+			<components:CircleButton icon="@Embed( source='assets/images/minimize.png' )" radius="8" click="nativeWindow.minimize()" />
+			<components:CircleButton icon="@Embed( source='assets/images/close.png' )" radius="8" click="nativeApplication.exit()" />
+		</s:HGroup>
+		
+		<s:VGroup width="100%" paddingLeft="20" paddingTop="10" paddingRight="20" horizontalAlign="center" gap="10">
+			<!-- 타이틀 -->
+			<s:Label text="Lyrics Dictation v1.0.0" fontSize="13" fontWeight="bold" mouseEnabled="false" />
+			
+			<!-- 플레이어 -->
+			<s:HGroup width="100%" height="70" gap="20">
+				<s:VGroup height="100%" gap="10">
+					<s:HGroup verticalAlign="middle" gap="5">
+						<!-- 이전구간 버튼 -->
+						<components:CircleButton icon="@Embed( source='assets/images/prev.png' )" radius="18" click="onPrevButtonClick( event )" toolTip="이전구간" />
+						
+						<!-- 재생/일시정지 버튼 -->
+						<components:PlayPauseButton id="playPauseButton" playIcon="@Embed( source='assets/images/play.png' )" pauseIcon="@Embed( source='assets/images/pause.png' )" radius="20" click="onPlayPauseButtonClick( event )" />
+						
+						<!-- 다음구간 버튼 -->
+						<components:CircleButton icon="@Embed( source='assets/images/next.png' )" radius="18" click="onNextButtonClick( event )" toolTip="다음구간" />
+					</s:HGroup>
+					
+					<!-- 볼륨 슬라이더 -->
+					<s:HGroup height="100%" paddingLeft="4">
+						<s:BitmapImage source="@Embed( source='assets/images/volume_down.png' )" />
+						<s:HSlider id="volumeSlider" width="81" minimum="0" maximum="100" value="100" liveDragging="true" showDataTip="false"
+								   change="onVolumeSliderChange( event )" />
+						<s:BitmapImage source="@Embed( source='assets/images/volume_up.png' )" />
+					</s:HGroup>
+				</s:VGroup>
+				
+				<!-- LCD -->
+				<s:Group height="100%">
+					<s:BitmapImage source="@Embed( source='assets/images/lcd_bg.png', scaleGridLeft='10', scaleGridTop='10', scaleGridRight='90', scaleGridBottom='50' )" width="100%" height="100%" />
+					
+					<s:VGroup width="100%" height="100%" paddingLeft="10" paddingTop="5" paddingRight="12" paddingBottom="5" horizontalAlign="center" verticalAlign="middle">
+						<s:Label id="songTitleLabel" text="노래를 선택해주세요." />
+						<s:Label id="singerLabel" text="" />
+						<s:HGroup>
+							<s:Label id="timeLabel" text="0:00.00" width="48" textAlign="right" />
+							<s:HSlider id="timeSlider" width="240" showDataTip="false" maximum="0"
+									   changeStart="onTimeSliderChageStart( event )" changeEnd="onTimeSliderChageEnd( event )" />
+						</s:HGroup>
+					</s:VGroup>
+				</s:Group>
+				
+				<s:VGroup height="100%">
+					<!-- 음악 불러오기 버튼 -->
+					<components:CircleButton icon="@Embed( source='assets/images/song.png' )" radius="15"
+											 enabled.dictation="false"
+											 click="onLoadSongButtonClick( event )" toolTip="노래파일 불러오기" />
+					
+					<!-- 가사 불러오기 버튼 -->
+					<components:CircleButton icon="@Embed( source='assets/images/lyrics.png' )" radius="15"
+											 enabled.dictation="false"
+											 click="onLoadLyricsButtonClick( event )" toolTip="가사파일 불러오기" />
+				</s:VGroup>
+				
+				<s:VGroup height="100%" gap="10">
+					<s:Button label="받아쓰기" label.dictation="그만하기" height="30" cornerRadius="15" enabled.edit="false"
+							  click="onDictationButtonClick( event )" />
+					<s:CheckBox id="editModeCheckBox" label="가사편집" enabled.dictation="false" change="onEditModeCheckBoxChange( event )" />
+				</s:VGroup>
+			</s:HGroup>
+		</s:VGroup>
+	</s:Group>
+	
+	<s:Group includeIn="edit" width="100%" >
+		<s:BitmapImage source="@Embed( source='assets/images/menu_bg.png', scaleGridLeft='1', scaleGridTop='1', scaleGridRight='99', scaleGridBottom='22' )"
+					   width="100%" />
+		
+		<s:HGroup width="100%" height="100%" gap="20" horizontalAlign="center" verticalAlign="middle">
+			<s:Label text="가사 저장" click="onSaveLyricsButtonClick( event)" />
+			<s:Label text="변경 취소" click="onCancelChangesButtonClick( event )" />
+			<s:Label text="구간 추가" click="onAddLyricsButtonClick( event )" />
+			<s:Label text="구간 삭제" click="onDeleteLyricsButtonClick( event )" />
+		</s:HGroup>
+	</s:Group>
+	
+	<s:Group width="100%" height="100%">
+		<s:BitmapImage source="@Embed( source='assets/images/list_bg.png', scaleGridLeft='5', scaleGridTop='5', scaleGridRight='195', scaleGridBottom='195' )"
+					   width="100%" height="100%" />
+		
+		<s:VGroup width="100%" height="100%" paddingLeft="1" paddingTop="3">
+			<!-- 가사 리스트 -->
+			<s:List id="lyricsList" includeIn="study" width="100%" height="100%"
+					dataProvider="{lrcs}" itemRenderer="renderers.LyricsRenderer"
+					selectionColor="0xBBBBBB" rollOverColor="0xCCCCCC" borderVisible="false" contentBackgroundAlpha="0"
+					click="onLyricsListClick( event )" doubleClickEnabled="true" doubleClick="onLyricsListDoubleClick( event )" />
+			
+			<!-- 가사 입력 리스트 -->
+			<s:List id="lyricsInputList" includeIn="dictation" width="100%" height="100%"
+					dataProvider="{lrcs}" itemRenderer="renderers.LyricsInputRenderer"
+					change="onLyricsInputListChange( event )" useVirtualLayout="false"
+					selectionColor="0xBBBBBB" rollOverColor="0xCCCCCC" borderVisible="false" contentBackgroundAlpha="0" />
+			
+			<!-- 가사 편집 그리드 -->
+			<s:DataGrid id="lyricsEditGrid" includeIn="edit" width="100%" height="100%" dataProvider="{edittingLRCs}"
+						selectionColor="0xBBBBBB" rollOverColor="0xCCCCCC" borderVisible="false" contentBackgroundAlpha="0">
+				<s:columns>
+					<s:ArrayList>
+						<s:GridColumn dataField="formattedTimeString" headerText="시간" width="80" itemRenderer="renderers.LyricsTimeRenderer" />
+						<s:GridColumn dataField="lyrics" headerText="가사" itemRenderer="renderers.LyricsEditRenderer" />
+					</s:ArrayList>
+				</s:columns>
+			</s:DataGrid>
+			
+		</s:VGroup>
+	</s:Group>
+	
+	<s:Group width="100%">
+		<s:BitmapImage source="@Embed( source='assets/images/bottom_bg.png', scaleGridLeft='10', scaleGridTop='10', scaleGridRight='90', scaleGridBottom='25' )" width="100%" />
+		<s:HGroup width="100%" height="100%" horizontalAlign="center" verticalAlign="middle">
+			<s:Label text="xoul.kr" />
+		</s:HGroup>
+	</s:Group>
+</s:WindowedApplication>
